@@ -3,6 +3,7 @@ from qiskit_aer import AerSimulator
 from qiskit.circuit.library import zz_feature_map
 from qiskit.quantum_info import Statevector
 import numpy as np
+from sklearn.svm import SVC
 
 '''
  Purpose of this file:
@@ -91,9 +92,9 @@ def quantum_kernel(feature_map, A, B=None, shots=shots):
             positions.append( (i, j) )
 
     # Print check
-    print("circuits: ", circuits)
-    print("\n---------------------\n")
-    print("positions: ", positions)
+    # print("circuits: ", circuits)
+    # print("\n---------------------\n")
+    # print("positions: ", positions)
 
     compiled = qk.transpile(circuits, simulator, seed_transpiler=seed_simulator) # circuit --> gates simulator understands
     result = simulator.run(compiled, shots=shots).result() # runs simulator on transpiler with 1024 shots (default value)
@@ -192,7 +193,7 @@ def check_kernel(feature_map, X, shots=shots):
     
     return min(values) # correct kernel will have min(values) == 1
 
-def circuit_stats(n_features, reps=repititions): # 
+def circuit_stats(n_features, reps=repititions):
     '''
     ### Implementation Section ###
     circuit with:
@@ -200,18 +201,18 @@ def circuit_stats(n_features, reps=repititions): #
         - depth
         - two-qubit gate count
     '''
-    fm = feature_map(n_features, reps) # feature map with 
+    fm = feature_map(n_features, reps) # feature map with n features, repeated 2 times on default
 
     x = np.linspace(0.1, 1.0, n_features)
     # --> [0.1, 1.0]            --> 2-feature point
-    # --> [0.1, 0.4, 0.7, 1.0]  --> a 4-feature point
-    qc = quantum_circuit(fm, x, x[::-1]) # builds one real kernel circuit going through x as x and inverse(x) as x'
+    # --> [0.1, 0.4, 0.7, 1.0]  --> 4-feature point
+    qc = quantum_circuit(fm, x, x[::-1]) # builds one real kernel circuit going through x as x, and inverse(x) as x'
 
     compiled = qk.transpile( 
                          qc, 
                          basis_gates=["cx", "rz", "sx", "x"], # universal set of gates
-                         optimization_level=0, 
-                         seed_transpiler=seed_simulator
+                         optimization_level=0, # no optimization
+                         seed_transpiler=seed_simulator # fixed seed for repeatable results
                         )
     
     return {
@@ -221,3 +222,146 @@ def circuit_stats(n_features, reps=repititions): #
         "two_qubit_gates": compiled.num_nonlocal_gates(),   # number of CNOT's after transpiling (nonlocal gates need multiple qubits in the gate)
         "circuit": qc,                                      # circuit itself
     }
+
+
+### Full QSVM Run (Train, Test, Evaluate) ###
+def run_qsvm(X_train, y_train, 
+                X_test, y_test, 
+                C=1.0, shots=shots, exact=False, verbose=True):
+    '''
+    exact=False: shot-based kernel on the AerSimulator (real experiment)
+    exact=True:  statevector kernel (no shots).
+
+    Returns a dict with every number we report, so the notebook can print it.
+    '''
+
+    # Turning all inputted data into numpy arrays
+    X_train, X_test = np.asarray(X_train, float), np.asarray(X_test, float)
+    y_train, y_test = np.asarray(y_train), np.asarray(y_test)
+
+    n = X_train.shape[1] # number of features
+
+    # Validating data, making sure its properly scaled
+    # --> must be within [0, pi]
+    # 1e-9: tolerance for floating-point rounding
+    if X_train.min() < 0 or X_train.max() > np.pi + 1e-9:
+        print("WARNING: training features are outside [0, pi]; check preprocessing")
+
+    model = QSVM(C=C, shots=shots, exact=exact).fit(X_train, y_train)
+
+    K_test = model._kernel(X_test, X_train) # quantum kernel -> matrix of similarity scores between X_test and X_train. Used for predictions.
+
+    # training accuracy (using score() would create new kernel)
+    train_acc = float(np.mean(model.svc.predict(model.K_train) == y_train))
+    # test accuracy
+    test_acc = float(np.mean(model.svc.predict(K_test) == y_test))
+
+
+    off_diag = ~np.eye(len(X_train), dtype=bool) # skip diagonal because its always 1
+        # [[False,  True,  True],
+        #  [ True, False,  True],
+        #  [ True,  True, False]]
+
+    results = {
+        "n_features": n,                        # number of features 
+        "n_train": len(X_train),                # length of training examples
+        "n_test": len(X_test),                  # length of test examples
+        "shots": "exact" if exact else shots,   # exact --> exact_kernel
+        "train_acc": train_acc,                 # computed training accuracy
+        "test_acc": test_acc,                   # computed test accuracy
+        # measures overfitting: .9 (train) - .6 (test) = .3 --> training did much better, could be result of overfitting
+        "generalization_gap": train_acc - test_acc,
+        # average similarity of matrix (excluding diagonal), can tell us why our model is overfitting (if similarity between points are too low, every patient looks nrelated to every other, low generalization --> bad model)
+        "mean_off_diagonal_K": float(model.K_train[off_diag].mean()) if off_diag.any() else float("nan"),
+        # symmetric --> training model, A=B
+        "is_symmetric": bool(np.allclose(model.K_train, model.K_train.T)),
+    }
+
+    if  not exact:
+        # Checks that only make sense for the shot-based kernel
+        K_exact = exact_kernel(model.feature_map, X_train) # statevector compuation
+        
+        # proves K(x,x) = 1 for every point, showing circuit correctness
+        results["min_self_kernel"] = check_kernel(model.feature_map, X_train, shots)
+        # compares measured kernel with exact one (gives idea on shot noise's influence)
+        results["max_kernel_error_vs_exact"] = float(np.abs(model.K_train - K_exact).max())
+
+    if verbose: # prints results dictionary 
+        for key, value in results.items():
+            print(f"{key:>28}: {value:.4f}" if isinstance(value, float) else f"{key:>28}: {value}")
+    return results
+
+
+'''
+ ### QSVM Class ###
+
+- packaging all functions in ordered steps that make sense 
+
+__init__
+- C : regularization parameter (toleration of mistakes)
+# (Both SVM and QSVM get same C to not skew results)
+
+-shots: 512,1024 number of shots that get ran through simulator
+
+- exact : exact_kernel if True, quantum_kernel if False
+'''
+
+class QSVM:
+    def __init__(self, C=1.0, shots=shots, 
+                 exact=False): 
+        # Regularization (default = 1)
+        self.C = C
+        self.shots = shots    
+        self.exact = exact                      
+
+        # a normal SVM that accepts a kernel matrix, will which be replaced by our quantum kernel
+        self.svm = SVC(kernel="precomputed", C=C) 
+
+    def _kernel(self, A, B=None):
+        if self.exact:
+            return exact_kernel(self.feature_map, A, B)
+        return quantum_kernel(self.feature_map, A, B)
+
+    def fit(self, X_train, y_train): 
+        '''
+        Train the QSVM: --> X_train data points vs y_train true predictions
+        - build the feature map
+        - compute the training kernel (training points vs each other)
+        - fit SVM on it (with quantum or exact kernel, dependent on self.exact)
+        '''
+        # turn inputted data into an numpy array
+        X_train = np.asarray(X_train, dtype=float)
+
+        # needed to build K_test when we run predctions
+        self.X_train = X_train
+
+        self.feature_map = feature_map(X_train.shape[1], self.reps) # build feature map
+
+        # returns quantum kernel based on feature_map built above and X_train (A=B since we are using training points)
+        self.K_train = self._kernel(X_train)
+
+        # train model on svc using quantum kernel
+        self.svc.fit(self.K_train, y_train)
+
+        return self
+
+    def predict(self, X): 
+        # predict data points and return the list of predictions
+
+        # A --> new data points (test), B --> training points (X_train)
+        # Creates matrix of similarity scores between new points and training points
+        K = self._kernel(np.asarray(X, dtype=float), self.X_train) # quantum_kernel
+        
+        return self.svc.predict(K) # array([1, 0, 1, 1, 0, ..., 1]) of predictions for each new data point
+
+    def score(self, X, y):
+        '''
+        accuracy of our predictions
+
+        self.predict(X) --> model's guess with X as data points
+        np.asarray(y) --> true labels
+        # compare models guess vs true labels
+        # return (correc) / number_of_predictions) == accuracy
+        '''
+        
+        return float(np.mean(self.predict(X) == np.asarray(y)))
