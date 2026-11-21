@@ -9,7 +9,7 @@ from sklearn.svm import SVC
  Purpose of this file:
     1. Take in preprocessed data and features  (n=2,4 where n is the number of features)
     2. Implement QSVM (kernel is main difference from SVM)
-    3. Train and test model using train_test_split
+    3. Train and test model on split from preprocessing data
 
 Assignment requires:
 Fixing of random seeds
@@ -19,8 +19,8 @@ such as seed_simulator and seed_transpiler in Qiskit, so a rerun gives the same 
 '''
 
 seed_simulator = 42 # rerun gives same number with fixed seed
-shots = 1024 # different amount of shots to test for accuracy
-repititions = 2 # repitions of ZZ feature map to "entangle" features
+shots = 1024 # shots per kernel entry (default is 1024)
+repititions = 2 # repitions of ZZ feature map
 
 simulator = AerSimulator(seed_simulator=seed_simulator) # simulator with fixed seed
 
@@ -76,7 +76,7 @@ def quantum_kernel(feature_map, A, B=None, shots=shots):
         B = A
         K = np.eye(len(A)) # Creates diagonal using just A
     else:
-        K = np.zeros( (len(A),len(B)) ) # Creates diagonal with A and B on opposing sides
+        K = np.zeros( (len(A),len(B)) ) # test kernel --> rows = A (test points), columns = B (training points), all zeros to start
             # (len(A),len(B)) is shape, while len(A),len(B) are 2 diff args which doesnt work on zeros
 
     circuits, positions = [], [] # since we will be running the kernel in batches, we need to hold all of the circuits and positions in lists
@@ -110,7 +110,7 @@ def quantum_kernel(feature_map, A, B=None, shots=shots):
             [0, 1, 0],
             [0, 0, 1]]
     Steps through loop:    
-        1. k = 0, (i, j) = (0, 1) --> compare patient 1 vs patient 2
+        1. k = 0, (i, j) = (0, 1) --> compare patient 0 vs patient 1
         result:
             - result.get_counts(0)   # {'00': 903, '01': 9, '10': 104, '11': 8}
             - K[0, 1] = 903 / 1024 = 0.882
@@ -135,7 +135,7 @@ def quantum_kernel(feature_map, A, B=None, shots=shots):
     '''
     
     for k, (i, j) in enumerate(positions): # i == j would be 1 so we skip it
-        counts = result.get_counts(k) # gets counts for circuit[k], taken from simulator trained on 512,1024 shots
+        counts = result.get_counts(k) # gets counts for circuit[k], taken from simulator trained on number of shots
         # counts format --> {'00': 250, '01': 150, '10': 60, '11': 52 }
         K[i, j] = counts.get(all_zeros, 0) / shots # counts "00" / 1024 (default) to get probability
         # --> probability: similarity score between 2 patients or how much two quantum states overlap
@@ -206,7 +206,7 @@ def circuit_stats(n_features, reps=repititions):
     x = np.linspace(0.1, 1.0, n_features)
     # --> [0.1, 1.0]            --> 2-feature point
     # --> [0.1, 0.4, 0.7, 1.0]  --> 4-feature point
-    qc = quantum_circuit(fm, x, x[::-1]) # builds one real kernel circuit going through x as x, and inverse(x) as x'
+    qc = quantum_circuit(fm, x, x[::-1]) # builds one real kernel circuit going through x as x, and inverse(x') as x'
 
     compiled = qk.transpile( 
                          qc, 
@@ -252,9 +252,9 @@ def run_qsvm(X_train, y_train,
     K_test = model._kernel(X_test, X_train) # quantum kernel -> matrix of similarity scores between X_test and X_train. Used for predictions.
 
     # training accuracy (using score() would create new kernel)
-    train_acc = float(np.mean(model.svc.predict(model.K_train) == y_train))
+    train_acc = float(np.mean(model.svm.predict(model.K_train) == y_train))
     # test accuracy
-    test_acc = float(np.mean(model.svc.predict(K_test) == y_test))
+    test_acc = float(np.mean(model.svm.predict(K_test) == y_test))
 
 
     off_diag = ~np.eye(len(X_train), dtype=bool) # skip diagonal because its always 1
@@ -271,7 +271,7 @@ def run_qsvm(X_train, y_train,
         "test_acc": test_acc,                   # computed test accuracy
         # measures overfitting: .9 (train) - .6 (test) = .3 --> training did much better, could be result of overfitting
         "generalization_gap": train_acc - test_acc,
-        # average similarity of matrix (excluding diagonal), can tell us why our model is overfitting (if similarity between points are too low, every patient looks nrelated to every other, low generalization --> bad model)
+        # average similarity of matrix (excluding diagonal), can tell us why our model is overfitting (if similarity between points are too low, every patient looks unrelated to every other, low generalization --> bad model)
         "mean_off_diagonal_K": float(model.K_train[off_diag].mean()) if off_diag.any() else float("nan"),
         # symmetric --> training model, A=B
         "is_symmetric": bool(np.allclose(model.K_train, model.K_train.T)),
@@ -290,6 +290,8 @@ def run_qsvm(X_train, y_train,
         for key, value in results.items():
             print(f"{key:>28}: {value:.4f}" if isinstance(value, float) else f"{key:>28}: {value}")
     return results
+
+### Repeating Trials of QSVM run###
 
 
 '''
@@ -312,7 +314,8 @@ class QSVM:
         # Regularization (default = 1)
         self.C = C
         self.shots = shots    
-        self.exact = exact                      
+        self.exact = exact
+        self.reps = repititions                      
 
         # a normal SVM that accepts a kernel matrix, will which be replaced by our quantum kernel
         self.svm = SVC(kernel="precomputed", C=C) 
@@ -320,7 +323,7 @@ class QSVM:
     def _kernel(self, A, B=None):
         if self.exact:
             return exact_kernel(self.feature_map, A, B)
-        return quantum_kernel(self.feature_map, A, B)
+        return quantum_kernel(self.feature_map, A, B, self.shots)
 
     def fit(self, X_train, y_train): 
         '''
@@ -341,7 +344,7 @@ class QSVM:
         self.K_train = self._kernel(X_train)
 
         # train model on svc using quantum kernel
-        self.svc.fit(self.K_train, y_train)
+        self.svm.fit(self.K_train, y_train)
 
         return self
 
@@ -352,7 +355,7 @@ class QSVM:
         # Creates matrix of similarity scores between new points and training points
         K = self._kernel(np.asarray(X, dtype=float), self.X_train) # quantum_kernel
         
-        return self.svc.predict(K) # array([1, 0, 1, 1, 0, ..., 1]) of predictions for each new data point
+        return self.svm.predict(K) # array([1, 0, 1, 1, 0, ..., 1]) of predictions for each new data point
 
     def score(self, X, y):
         '''
@@ -365,3 +368,21 @@ class QSVM:
         '''
         
         return float(np.mean(self.predict(X) == np.asarray(y)))
+
+
+### Visualizations and summary of circuits ###
+def print_circuit_table():
+    """Print qubits, depth and CNOT (cx) count for n=2, n=4"""
+    print(f"{'Qubits':>6} | {'Depth before':>12} | {'Depth after':>11} | {'Two-qubit gates':>15}")
+    for n in (2, 4):
+        s = circuit_stats(n)
+        print(f"{s['qubits']:>6} | {s['logical_depth']:>12} | {s['transpiled_depth']:>11} | {s['two_qubit_gates']:>15}")
+
+def draw_smallest_circuit(path="kernel_circuit_2q.png"):
+    """Save Figure 1, the 2-qubit kernel circuit as Qiskit draws it.
+
+    Needs `pip install pylatexenc` for the matplotlib drawer.
+    """
+    fig = circuit_stats(2)["circuit"].draw("mpl", fold=-1)
+    fig.savefig(path, bbox_inches="tight")
+    return fig
